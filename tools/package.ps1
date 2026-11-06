@@ -28,7 +28,20 @@ try {
     New-Item -ItemType Directory -Force $Out | Out-Null
     $zip = Join-Path (Resolve-Path $Out) "TXRChaseCam-$Version.zip"
     if (Test-Path $zip) { Remove-Item $zip }
-    Compress-Archive -Path (Join-Path $stage "*") -DestinationPath $zip
+    # Not Compress-Archive: on Windows PowerShell 5.1 it stores entry names with backslashes
+    # ("TXRChaseCam\Scripts\main.lua"), which Linux / Steam Deck extractors unpack as single
+    # files with backslashes in their names. The zip format wants "/", so write entries ourselves.
+    Add-Type -AssemblyName System.IO.Compression, System.IO.Compression.FileSystem
+    $archive = [IO.Compression.ZipFile]::Open($zip, [IO.Compression.ZipArchiveMode]::Create)
+    try {
+        Get-ChildItem $stage -Recurse -File | ForEach-Object {
+            $entry = $_.FullName.Substring($stage.Length + 1).Replace('\', '/')
+            [void][IO.Compression.ZipFileExtensions]::CreateEntryFromFile($archive, $_.FullName, $entry,
+                [IO.Compression.CompressionLevel]::Optimal)
+        }
+    } finally {
+        $archive.Dispose()
+    }
     Write-Host "Packed $zip"
     Get-ChildItem $stage -Recurse -File | ForEach-Object { "  " + $_.FullName.Substring($stage.Length + 1) }
 } finally {
