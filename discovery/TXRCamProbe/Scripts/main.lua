@@ -509,8 +509,11 @@ function dumpGkInput()
 end
 
 -- Key-state checks for the live log: the engine's virtual right-stick keys and analog axes.
+-- W / SpaceBar / Up are keyboard controls: if those register but the gamepad keys don't, Genki's
+-- input layer swallows the gamepad before PlayerInput; if nothing registers, it's the Lua FKey.
 local KEY_CHECKS = { "Gamepad_RightX", "Gamepad_RightY", "Gamepad_RightStick_Left", "Gamepad_RightStick_Right",
-                     "Gamepad_RightStick_Up", "Gamepad_RightStick_Down", "Gamepad_FaceButton_Bottom" }
+                     "Gamepad_RightStick_Up", "Gamepad_RightStick_Down", "Gamepad_FaceButton_Bottom",
+                     "Gamepad_LeftX", "Gamepad_RightTriggerAxis", "W", "SpaceBar", "Up" }
 function keyStatesLine(pc)
     local parts = {}
     for _, k in ipairs(KEY_CHECKS) do

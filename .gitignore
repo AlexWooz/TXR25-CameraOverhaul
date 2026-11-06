@@ -1,1 +1,4 @@
 *.log
+native/RE-UE4SS/
+native/build/
+release/*.zip

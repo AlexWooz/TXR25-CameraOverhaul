@@ -7,19 +7,29 @@
 -- falls behind when the car turns in, showing the side of the car, and catches up on exit.
 -- The game's slip-angle swing keeps working on top of it.
 --
--- Keys (keyboard, for tuning):
+-- Settings: the defaults are in the Config table below; players override them in
+-- Scripts/config.lua (loaded on start and on UE4SS hot reload).
+--
+-- Keys:
 --   Ctrl+F6          toggle the mod on/off (to compare with vanilla)
+-- With DevKeys = true (config.lua), also:
 --   Ctrl+Up/Down     LagSpeed +/- 0.5   (higher = stiffer, catches up faster)
 --   Ctrl+Right/Left  MaxOffset +/- 5    (max degrees the camera can trail)
 --   Ctrl+F5          toggle debug log (4x/s: speed, yaw rate, offset)
 --   Ctrl+PgUp/PgDn   close-view distance +/- 25
 --   Ctrl+Home/End    close-view height +/- 10
+--   Ctrl+Ins/Del     nitro FOV +/- 5
+--   Ctrl+] / [       game's vertical shake scale +/- 0.1
+--   Ctrl+= / -       speed shake strength +/- 0.1
+--   Ctrl+B           motion blur + boost fringe/vignette on/off
 --
 -- Right stick (controller): orbit around the car in the chase and far views. Left/right spins
 -- the camera, down swings it to the front, releasing eases it back. See the Orbit section.
 
 local Config = {
     Enabled = true,
+    -- Tuning keys (Ctrl+arrows, PgUp/PgDn, ...) and the Ctrl+F5 debug log. Off for players.
+    DevKeys = false,
     -- How fast the camera heading catches up with the car's heading (1/s).
     -- In a steady turn the camera trails by about yaw_rate / LagSpeed degrees,
     -- e.g. 20 deg/s of turning at LagSpeed 2.5 gives 8 degrees.
@@ -42,6 +52,51 @@ local Config = {
     CloseDistanceOffset = 100,
     CloseHeightOffset = 0,
 
+    -- FOV while boosting (car's nitro_camera_fov; vanilla 120, normal is 90). The "camera goes
+    -- far back" feel on nitro is this FOV; the arm's own pull-back is only ~10 units.
+    NitroFov = 105,
+    -- The game's own shake is a vertical bounce (BP_LinearShake on the arm, 80-250 km/h);
+    -- VerticalShakeScale multiplies it through the arm's SetShakeCoef. Our shake replaces most of it.
+    VerticalShakeScale = 0.25,
+
+    -- Speed shake: smooth noise on the camera's own rotation (the arm carries the camera, the
+    -- camera's relative rotation is otherwise untouched by the game). A fast vibration plus a
+    -- slower sway; both get stronger AND faster with speed between ShakeMinKmh and ShakeMaxKmh
+    -- (intensity ramps as speed^ShakeCurve, so it's calm when cruising and builds near the top).
+    ShakeStrength = 1.0,       -- overall multiplier (Ctrl+= / Ctrl+-)
+    ShakeMinKmh = 40,
+    ShakeMaxKmh = 280,
+    ShakeCurve = 1.3,
+    ShakeHzMin = 5,            -- vibration frequency at ShakeMinKmh -> ShakeHzMax at ShakeMaxKmh
+    ShakeHzMax = 14,
+    ShakePitch = 0.25,         -- degrees at ShakeMaxKmh
+    ShakeYaw = 0.20,
+    ShakeRoll = 0.35,
+    SwayHzMin = 0.6,           -- sway frequency, same idea
+    SwayHzMax = 2.0,
+    SwayYaw = 0.35,
+    SwayRoll = 0.45,
+
+    -- Boost (detected from the car's nitro_charge dropping). Starting a boost gives a short kick
+    -- (extra shake and FOV) that decays; holding it adds a little shake, fringe and vignette.
+    BoostKickShake = 2.5,      -- extra shake multiplier at the kick's peak
+    BoostKickFov = 8,          -- extra degrees on top of NitroFov at the kick's peak
+    BoostKickDecay = 3,        -- 1/s
+    BoostHoldShake = 0.5,      -- extra shake multiplier while boosting
+    BoostFringe = 1.5,         -- chromatic aberration while boosting (0 = off)
+    BoostVignette = 0.25,      -- extra vignette while boosting (0 = off)
+
+    -- Acceleration feel: widens the arm's own acceleration movement range [min, max] =
+    -- [-AccelPushIn, AccelPullback] (vanilla [0, 10]): the camera falls back further when
+    -- accelerating and closes in a little when braking.
+    AccelPullback = 50,
+    AccelPushIn = 15,
+
+    -- Motion blur that grows with speed (r.MotionBlur.Amount; 0 = leave the game's). Only
+    -- visible if motion blur is enabled in the game's graphics options.
+    MotionBlurMax = 0.4,       -- blur amount at ShakeMaxKmh
+    PostFx = true,             -- motion blur + boost fringe/vignette (Ctrl+B)
+
     -- Right-stick orbit (chase and far views). The game only reports the stick past ~75%
     -- deflection, as separate look-left/right/back signals (nothing for up).
     --   "direct": the camera looks where the stick points (stick right -> camera on the car's
@@ -52,6 +107,13 @@ local Config = {
     OrbitEnabled = true,
     OrbitMode = "direct",
     OrbitFollowSpeed = 10,     -- direct: how fast the camera reaches the stick angle (1/s)
+    -- With the TXRChaseCamInput C++ mod installed, direct mode reads the real stick through
+    -- XInput (any angle, any deflection past this dead zone) instead of the game's signals.
+    OrbitStickDeadZone = 0.3,
+    -- Real stick only: a partial push turns the camera partway (half right ~ 45 degrees),
+    -- reaching the full angle at OrbitStickFullAt deflection. false = direction only.
+    OrbitScaleWithDeflection = true,
+    OrbitStickFullAt = 0.95,
     OrbitSpeed = 150,          -- spin: degrees per second at full deflection
     OrbitInvert = false,       -- flip left/right
     OrbitReturnDelay = 0.03,   -- seconds after release before easing back (bridges gaps between signals)
@@ -60,6 +122,41 @@ local Config = {
 
 local function log(fmt, ...)
     print(string.format("[TXRChaseCam] " .. fmt .. "\n", ...))
+end
+
+-- Player config -------------------------------------------------------------
+-- Scripts/config.lua returns a table of overrides, e.g. return { NitroFov = 110 }. It's loaded
+-- by path next to this file (not require, so a "config" module elsewhere can't shadow it).
+-- Unknown names and wrong types are reported and ignored; a broken file keeps the defaults.
+do
+    local source = (debug and debug.getinfo) and (debug.getinfo(1, "S").source or "") or ""
+    local dir = source:match("^@(.*[\\/])") or ""
+    local path = dir .. "config.lua"
+    local f = io and io.open(path, "r")
+    if io and f == nil then
+        log("no config.lua next to main.lua, using defaults")
+    else
+        if f then f:close() end
+        local ok, user = pcall(dofile, path)
+        if not ok then
+            log("config.lua has an error, using defaults: %s", tostring(user))
+        elseif type(user) ~= "table" then
+            log("config.lua must end with 'return { ... }', using defaults")
+        else
+            local applied = 0
+            for k, v in pairs(user) do
+                if Config[k] == nil then
+                    log("config.lua: unknown setting '%s' ignored", tostring(k))
+                elseif type(v) ~= type(Config[k]) then
+                    log("config.lua: '%s' should be a %s, ignored", k, type(Config[k]))
+                else
+                    Config[k] = v
+                    applied = applied + 1
+                end
+            end
+            log("config.lua: %d setting(s) applied", applied)
+        end
+    end
 end
 
 local function valid(obj)
@@ -179,6 +276,234 @@ local function update(dt)
     setArmOffsets(state.offset + orbitYaw)
 
     applyCloseViewOffsets()
+    local boost = updateBoost(dt, pawn)
+    applyNitroFov(pawn, Config.BoostKickFov * boost.kick)
+    applyVerticalShake()
+    applyAccelFeel()
+    applySpeedShake(dt, kmh, pawn, boost)
+    applyPostFx(kmh, pawn, boost)
+    debugTick(dt)
+end
+
+-- Nitro FOV and shake -------------------------------------------------------
+-- Like the distance/height setters, these only write when the game's value differs from ours,
+-- so the game is free to reset them (new car, menus) and we put them back.
+
+local vanilla = { nitroFov = nil, nitroOffset = nil, maxMove = {}, minMove = {}, camRot = {} }
+
+function applyNitroFov(pawn, extra)
+    local ok, cur = pcall(function() return pawn.nitro_camera_fov end)
+    if not ok or type(cur) ~= "number" then return end
+    if vanilla.nitroFov == nil then
+        vanilla.nitroFov, vanilla.nitroOffset = cur, pawn.nitro_offset_fov
+    end
+    local want = Config.NitroFov + (extra or 0)
+    if math.abs(cur - want) > 0.01 then
+        pawn.nitro_camera_fov = want
+        -- nitro_offset_fov (vanilla 30) is the same boost expressed relative to default_camera_fov.
+        pcall(function() pawn.nitro_offset_fov = want - pawn.default_camera_fov end)
+    end
+end
+
+function applyVerticalShake()
+    for _, arm in ipairs(state.arms) do
+        if valid(arm) then
+            local ok, cur = pcall(function() return arm.shake_coef end)
+            if ok and type(cur) == "number" and math.abs(cur - Config.VerticalShakeScale) > 0.001 then
+                arm:SetShakeCoef(Config.VerticalShakeScale)
+            end
+        end
+    end
+end
+
+-- Boost -------------------------------------------------------------------
+-- No boost flag was found on the car, but nitro_charge drains while boosting (and only then),
+-- so a falling charge means boosting. level eases 0..1 with it; kick jumps to 1 when a boost
+-- starts and decays.
+local boost = { lastCharge = nil, rate = 0, active = false, level = 0, kick = 0 }
+
+function updateBoost(dt, pawn)
+    local ok, charge = pcall(function() return pawn.nitro_charge end)
+    if ok and type(charge) == "number" then
+        if boost.lastCharge ~= nil then
+            -- Smoothed drain rate (charge units per second; positive = draining).
+            local r = (boost.lastCharge - charge) / dt
+            boost.rate = boost.rate + (r - boost.rate) * (1 - math.exp(-10 * dt))
+        end
+        boost.lastCharge = charge
+    end
+    local active = boost.rate > 50
+    if active and not boost.active then boost.kick = 1 end
+    boost.active = active
+    boost.level = boost.level + ((active and 1 or 0) - boost.level) * (1 - math.exp(-4 * dt))
+    boost.kick = boost.kick * math.exp(-Config.BoostKickDecay * dt)
+    return boost
+end
+
+-- Speed shake ---------------------------------------------------------------
+
+-- Smooth 1D value noise in -1..1 (hashed lattice values, smoothstep between them).
+local function hash(i, seed)
+    local x = math.sin(i * 127.1 + seed * 311.7) * 43758.5453
+    return (x - math.floor(x)) * 2 - 1
+end
+local function noise(t, seed)
+    local i = math.floor(t)
+    local f = t - i
+    local u = f * f * (3 - 2 * f)
+    return hash(i, seed) * (1 - u) + hash(i + 1, seed) * u
+end
+local function fbm(t, seed)
+    return noise(t, seed) * 0.7 + noise(t * 2.13, seed + 17) * 0.3
+end
+
+-- Noise phases, advanced by frequency * dt each frame so the frequency can change smoothly
+-- with speed (using time * frequency would jump whenever the frequency changes).
+local shakePhase, swayPhase = 0, 0
+
+-- The chase cameras (OutCamera on CameraArm, FarCamera on CameraArmForFar); their relative
+-- rotation is ours to use. The first value seen is kept as the rest pose.
+local function chaseCameras(pawn)
+    local cams = {}
+    for _, n in ipairs({ "OutCamera", "FarCamera" }) do
+        local ok, c = pcall(function() return pawn[n] end)
+        if ok and valid(c) then
+            local addr = c:GetAddress()
+            if vanilla.camRot[addr] == nil then
+                local r = c.RelativeRotation
+                vanilla.camRot[addr] = { Pitch = r.Pitch or 0, Yaw = r.Yaw or 0, Roll = r.Roll or 0 }
+            end
+            table.insert(cams, c)
+        end
+    end
+    return cams
+end
+
+local function setCamRotation(cam, p, y, r)
+    local base = vanilla.camRot[cam:GetAddress()]
+    cam:K2_SetRelativeRotation({ Pitch = base.Pitch + p, Yaw = base.Yaw + y, Roll = base.Roll + r }, false, {}, false)
+end
+
+function applySpeedShake(dt, kmh, pawn, b)
+    local span = math.max(Config.ShakeMaxKmh - Config.ShakeMinKmh, 1)
+    local lin = clamp((kmh - Config.ShakeMinKmh) / span, 0, 1)
+    local sf = lin ^ Config.ShakeCurve
+    local intensity = Config.ShakeStrength * (sf * (1 + Config.BoostHoldShake * b.level)
+        + Config.BoostKickShake * b.kick * math.max(sf, 0.3))
+    state.shakeIntensity = intensity
+
+    -- Faster with speed (boost pushes it a bit further).
+    local speedHz = clamp(lin + 0.3 * b.level, 0, 1.3)
+    local shakeHz = Config.ShakeHzMin + (Config.ShakeHzMax - Config.ShakeHzMin) * speedHz
+    local swayHz = Config.SwayHzMin + (Config.SwayHzMax - Config.SwayHzMin) * speedHz
+    state.shakeHz = shakeHz
+    shakePhase = (shakePhase + shakeHz * dt) % 100000
+    swayPhase = (swayPhase + swayHz * dt) % 100000
+
+    local tf, ts = shakePhase, swayPhase
+    local p = intensity * Config.ShakePitch * fbm(tf, 1)
+    local y = intensity * (Config.ShakeYaw * fbm(tf, 2) + Config.SwayYaw * noise(ts, 3))
+    local r = intensity * (Config.ShakeRoll * fbm(tf, 4) + Config.SwayRoll * noise(ts, 5))
+    for _, cam in ipairs(chaseCameras(pawn)) do
+        setCamRotation(cam, p, y, r)
+    end
+end
+
+-- Acceleration feel ---------------------------------------------------------
+-- The arm already moves the camera along its length with acceleration (acc_scale_for_x_move),
+-- clamped to [min_move_target_length, max_move_target_length] = [0, 10] in vanilla.
+
+function applyAccelFeel()
+    for _, arm in ipairs(state.arms) do
+        if valid(arm) then
+            local addr = arm:GetAddress()
+            pcall(function()
+                if vanilla.maxMove[addr] == nil then
+                    vanilla.maxMove[addr], vanilla.minMove[addr] = arm.max_move_target_length, arm.min_move_target_length
+                end
+                if arm.max_move_target_length ~= Config.AccelPullback then arm.max_move_target_length = Config.AccelPullback end
+                if arm.min_move_target_length ~= -Config.AccelPushIn then arm.min_move_target_length = -Config.AccelPushIn end
+            end)
+        end
+    end
+end
+
+-- Post-process: speed motion blur, boost fringe and vignette ------------------
+-- Written into the chase cameras' PostProcessSettings (blend weight 1). If the struct can't be
+-- written from Lua, this logs once and switches itself off.
+
+local postFxBroken = false
+
+-- Motion blur goes through the r.MotionBlur.Amount cvar (writes into the camera's
+-- PostProcessSettings had no visible effect in test 1). -1 = use the game's post-process value.
+local ksl = nil
+lastBlur = nil
+local function setBlurCvar(amount, pawn)
+    if lastBlur ~= nil and math.abs(amount - lastBlur) < 0.02 then return end
+    ksl = ksl or StaticFindObject("/Script/Engine.Default__KismetSystemLibrary")
+    ksl:ExecuteConsoleCommand(pawn, string.format("r.MotionBlur.Amount %.2f", amount), state.pc)
+    lastBlur = amount
+end
+
+local function setPostFx(cam, fringe, vignette)
+    local pp = cam.PostProcessSettings
+    pp.bOverride_SceneFringeIntensity = fringe ~= nil
+    if fringe ~= nil then pp.SceneFringeIntensity = fringe end
+    pp.bOverride_VignetteIntensity = vignette ~= nil
+    if vignette ~= nil then pp.VignetteIntensity = vignette end
+end
+
+function applyPostFx(kmh, pawn, b)
+    local on = Config.PostFx
+    local span = math.max(Config.ShakeMaxKmh - Config.ShakeMinKmh, 1)
+    local sf = clamp((kmh - Config.ShakeMinKmh) / span, 0, 1)
+    local okB, errB = pcall(setBlurCvar, (on and Config.MotionBlurMax > 0) and (Config.MotionBlurMax * sf) or -1, pawn)
+    if not okB and lastBlur == nil then
+        log("motion blur cvar failed: %s", tostring(errB))
+        lastBlur = -2
+    end
+
+    if postFxBroken then return end
+    local fringe = (on and Config.BoostFringe > 0) and (Config.BoostFringe * b.level) or nil
+    -- 0.4 is UE's default vignette intensity.
+    local vignette = (on and Config.BoostVignette > 0) and (0.4 + Config.BoostVignette * b.level) or nil
+    for _, cam in ipairs(chaseCameras(pawn)) do
+        local ok, err = pcall(setPostFx, cam, fringe, vignette)
+        if not ok then
+            log("post-process override unavailable (%s); motion blur/fringe/vignette off", tostring(err))
+            postFxBroken = true
+            return
+        end
+    end
+end
+
+-- Puts the game's own camera behaviour back (mod toggled off).
+function restoreVanillaCameraFx()
+    local pawn = state.pawn
+    if valid(pawn) and vanilla.nitroFov ~= nil then
+        pawn.nitro_camera_fov = vanilla.nitroFov
+        pcall(function() pawn.nitro_offset_fov = vanilla.nitroOffset end)
+    end
+    for _, arm in ipairs(state.arms) do
+        if valid(arm) then
+            local addr = arm:GetAddress()
+            pcall(function() arm:SetShakeCoef(1) end)
+            pcall(function()
+                if vanilla.maxMove[addr] ~= nil then
+                    arm.max_move_target_length = vanilla.maxMove[addr]
+                    arm.min_move_target_length = vanilla.minMove[addr]
+                end
+            end)
+        end
+    end
+    if valid(pawn) then
+        for _, cam in ipairs(chaseCameras(pawn)) do
+            pcall(setCamRotation, cam, 0, 0, 0)
+            if not postFxBroken then pcall(setPostFx, cam, nil, nil) end
+        end
+        lastBlur = nil
+        pcall(setBlurCvar, -1, pawn)
+    end
 end
 
 -- Orbit -------------------------------------------------------------------
@@ -206,6 +531,23 @@ local function stickLookAngle(x, back)
     if x ~= 0 then orbit.lastSide = x > 0 and 1 or -1 end
     orbit.lowerHalf = fwd < 0
     return math.deg(math.atan(x, fwd))
+end
+
+-- TXRGetRightStick is registered by the TXRChaseCamInput C++ mod; without it (or with no
+-- XInput controller) this reports "not connected" and the orbit uses the game's signals.
+local loggedStickSource = nil
+function readRealStick()
+    local x, y, connected = 0, 0, false
+    if TXRGetRightStick ~= nil then
+        local ok, rx, ry, rc = pcall(TXRGetRightStick)
+        if ok then x, y, connected = rx, ry, rc end
+    end
+    local source = connected and "XInput (TXRChaseCamInput)" or "game look signals"
+    if source ~= loggedStickSource then
+        log("orbit stick source: %s", source)
+        loggedStickSource = source
+    end
+    return x, y, connected
 end
 
 local function lookActive(dir)
@@ -238,9 +580,33 @@ function updateOrbit(dt)
     local held = backOn or rightOn or leftOn
 
     if Config.OrbitMode == "direct" then
-        local x = (rightOn and clamp(rightMag, 0, 1) or 0) - (leftOn and clamp(leftMag, 0, 1) or 0)
-        if Config.OrbitInvert then x = -x end
-        local target = stickLookAngle(x, backOn and clamp(backMag, 0, 1) or 0)
+        local target
+        local sx, sy, connected = readRealStick()
+        if connected then
+            -- Real stick: look where it points (up = 0, right = +90, down = 180).
+            if Config.OrbitInvert then sx = -sx end
+            local mag = math.sqrt(sx * sx + sy * sy)
+            if mag > Config.OrbitStickDeadZone then
+                local angle = math.deg(math.atan(sx, sy))
+                -- Near straight down the sign of x is noise; keep the side we were on so a
+                -- partial push doesn't flip between left and right.
+                if math.abs(angle) > 170 and orbit.lastSide ~= 0 then
+                    angle = orbit.lastSide * math.abs(angle)
+                elseif sx ~= 0 then
+                    orbit.lastSide = sx > 0 and 1 or -1
+                end
+                if Config.OrbitScaleWithDeflection then
+                    local span = math.max(Config.OrbitStickFullAt - Config.OrbitStickDeadZone, 0.01)
+                    angle = angle * clamp((mag - Config.OrbitStickDeadZone) / span, 0, 1)
+                end
+                target = angle
+                held = true
+            end
+        else
+            local x = (rightOn and clamp(rightMag, 0, 1) or 0) - (leftOn and clamp(leftMag, 0, 1) or 0)
+            if Config.OrbitInvert then x = -x end
+            target = stickLookAngle(x, backOn and clamp(backMag, 0, 1) or 0)
+        end
         if target ~= nil then
             orbit.yaw = wrap(orbit.yaw + wrap(target - orbit.yaw) * (1 - math.exp(-Config.OrbitFollowSpeed * dt)))
             orbit.lastInputAt = now
@@ -389,22 +755,37 @@ end)
 
 -- Debug log ---------------------------------------------------------------
 
+-- Called from update() on the game thread, 4x/s while Ctrl+F5 is on. (A LoopAsync version read
+-- these tables from UE4SS's async thread while the camera hook wrote them, and crashed the game.)
 -- "cam-car" is measured from the camera manager, so it shows whether the offset turns the
 -- camera the intended way (it should be close to offset, plus the game's own slip swing).
-LoopAsync(250, function()
-    if state.debug then
-        ExecuteInGameThread(function()
-            pcall(function()
-                local gap = wrap(state.pc.PlayerCameraManager:GetCameraRotation().Yaw - state.pawn:K2_GetActorRotation().Yaw)
-                local gameSlip = 0
-                pcall(function() gameSlip = state.mainArm.slip_angle end)
-                log("%s %6.1f km/h  yaw rate %7.1f deg/s  offset %6.2f  orbit %7.1f  game slip %6.2f  cam-car %6.2f",
-                    Config.Enabled and "ON " or "OFF", state.kmh, state.yawRate, state.offset, orbit.yaw, gameSlip, gap)
-            end)
+-- "cam rot" and "pp" read back what we wrote, to see whether shake/post-process stick.
+local debugTimer = 0
+function debugTick(dt)
+    if not state.debug then return end
+    debugTimer = debugTimer + dt
+    if debugTimer < 0.25 then return end
+    debugTimer = 0
+    local ok, err = pcall(function()
+        local gap = wrap(state.pc.PlayerCameraManager:GetCameraRotation().Yaw - state.pawn:K2_GetActorRotation().Yaw)
+        local arm = state.mainArm
+        local camRot, pp = "?", "?"
+        pcall(function()
+            local r = state.pawn.OutCamera.RelativeRotation
+            camRot = string.format("%.2f/%.2f/%.2f", r.Pitch or 0, r.Yaw or 0, r.Roll or 0)
         end)
-    end
-    return false
-end)
+        pcall(function()
+            local s = state.pawn.OutCamera.PostProcessSettings
+            pp = string.format("fringe %s:%.2f vig %s:%.2f", tostring(s.bOverride_SceneFringeIntensity), s.SceneFringeIntensity,
+                tostring(s.bOverride_VignetteIntensity), s.VignetteIntensity)
+        end)
+        log("%6.1f km/h  yaw rate %6.1f  offset %5.1f  orbit %6.1f  slip %5.1f  cam-car %5.1f  shake %.2f @%.1fHz  cam rot %s  boost %.2f/%.2f (rate %.0f)  arm acc %.1f len %.1f  fov %.1f  blur %.2f  %s",
+            state.kmh, state.yawRate, state.offset, orbit.yaw, arm.slip_angle or 0, gap,
+            state.shakeIntensity or 0, state.shakeHz or 0, camRot, boost.level, boost.kick, boost.rate,
+            arm.acc or 0, arm.target_length or 0, state.pc.PlayerCameraManager:GetFOVAngle(), lastBlur or -1, pp)
+    end)
+    if not ok then log("debug failed: %s", tostring(err)) end
+end
 
 -- Keys --------------------------------------------------------------------
 
@@ -418,9 +799,13 @@ RegisterKeyBind(Key.F6, { ModifierKey.CONTROL }, function()
             state.mainArm:SetRelativeLocationZOffset(0)
             applied = { arm = state.mainArm:GetAddress(), distance = 0, height = 0 }
         end)
+        if not Config.Enabled then pcall(restoreVanillaCameraFx) end
     end)
     log("chase cam %s", Config.Enabled and "ON" or "OFF (vanilla)")
 end)
+
+-- Everything below is for tuning (DevKeys = true in config.lua).
+if Config.DevKeys then
 
 RegisterKeyBind(Key.F5, { ModifierKey.CONTROL }, function()
     state.debug = not state.debug
@@ -428,9 +813,40 @@ RegisterKeyBind(Key.F5, { ModifierKey.CONTROL }, function()
 end)
 
 local function tuned()
-    log("LagSpeed %.1f  MaxOffset %d  CloseDistanceOffset %d  CloseHeightOffset %d",
-        Config.LagSpeed, Config.MaxOffset, Config.CloseDistanceOffset, Config.CloseHeightOffset)
+    log("LagSpeed %.1f  MaxOffset %d  CloseDistanceOffset %d  CloseHeightOffset %d  NitroFov %d  VerticalShakeScale %.1f  ShakeStrength %.1f  PostFx %s",
+        Config.LagSpeed, Config.MaxOffset, Config.CloseDistanceOffset, Config.CloseHeightOffset,
+        Config.NitroFov, Config.VerticalShakeScale, Config.ShakeStrength, tostring(Config.PostFx))
 end
+
+RegisterKeyBind(Key.B, { ModifierKey.CONTROL }, function()
+    Config.PostFx = not Config.PostFx
+    tuned()
+end)
+
+RegisterKeyBind(Key.INS, { ModifierKey.CONTROL }, function()
+    Config.NitroFov = math.min(130, Config.NitroFov + 5)
+    tuned()
+end)
+RegisterKeyBind(Key.DEL, { ModifierKey.CONTROL }, function()
+    Config.NitroFov = math.max(60, Config.NitroFov - 5)
+    tuned()
+end)
+RegisterKeyBind(Key.OEM_SIX, { ModifierKey.CONTROL }, function() -- ]
+    Config.VerticalShakeScale = math.min(3, Config.VerticalShakeScale + 0.1)
+    tuned()
+end)
+RegisterKeyBind(Key.OEM_FOUR, { ModifierKey.CONTROL }, function() -- [
+    Config.VerticalShakeScale = math.max(0, Config.VerticalShakeScale - 0.1)
+    tuned()
+end)
+RegisterKeyBind(Key.OEM_PLUS, { ModifierKey.CONTROL }, function() -- =
+    Config.ShakeStrength = math.min(5, Config.ShakeStrength + 0.1)
+    tuned()
+end)
+RegisterKeyBind(Key.OEM_MINUS, { ModifierKey.CONTROL }, function() -- -
+    Config.ShakeStrength = math.max(0, Config.ShakeStrength - 0.1)
+    tuned()
+end)
 
 RegisterKeyBind(Key.PAGE_UP, { ModifierKey.CONTROL }, function()
     Config.CloseDistanceOffset = Config.CloseDistanceOffset + 25
@@ -466,4 +882,6 @@ RegisterKeyBind(Key.LEFT_ARROW, { ModifierKey.CONTROL }, function()
     tuned()
 end)
 
-log("loaded (LagSpeed %.1f, MaxOffset %d). Ctrl+F6 toggle, Ctrl+arrows tune, Ctrl+F5 debug", Config.LagSpeed, Config.MaxOffset)
+end -- DevKeys
+
+log("loaded. Ctrl+F6 toggles the mod%s", Config.DevKeys and "; dev keys on (Ctrl+arrows etc. tune, Ctrl+F5 debug)" or "")
