@@ -3,7 +3,7 @@
 # The C++ helper must be built first:
 #   cmake --build native\build --config Game__Shipping__Win64 --target TXRChaseCamInput
 param(
-    [string]$Version = "1.0",
+    [string]$Version = "1.1",
     [string]$Out = (Join-Path $PSScriptRoot "..\release")
 )
 

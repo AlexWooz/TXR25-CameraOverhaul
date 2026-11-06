@@ -5,6 +5,7 @@ A camera overhaul for **Tokyo Xtreme Racer** (2025, Steam, UE5), as a UE4SS mod:
 - **Right-stick orbit:** the camera looks wherever the stick points, any angle, scaled by deflection. A small C++ helper (`TXRChaseCamInput`) reads the stick through XInput, because the game's own input layer never passes the analog stick to the engine.
 - **Sense of speed:** a speed-ramped shake on the camera's rotation (stronger and faster with speed) instead of most of the vanilla vertical bounce, a boost kick, a lower nitro FOV, a wider acceleration pull-back, and speed motion blur.
 - **Close view** sits 100 units further back.
+- **Smooth transitions:** blends into the driving camera where the game hard-cuts (e.g. after the leave-garage pan).
 
 Player install instructions are in [release/README.txt](release/README.txt); the release zip is built with `tools/package.ps1`.
 

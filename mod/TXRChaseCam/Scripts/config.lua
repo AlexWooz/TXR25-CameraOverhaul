@@ -29,6 +29,12 @@ return {
     OrbitFollowSpeed = 10,
     OrbitReturnSpeed = 12,
 
+    ---------------------------------------------------------------- Transitions
+    -- Smoothly blend into the driving camera instead of the game's hard cut
+    -- (e.g. at the end of the camera pan when leaving the garage).
+    SmoothViewCuts = true,
+    ViewCutBlendTime = 1.2,  -- seconds
+
     ---------------------------------------------------------------- Sense of speed
     -- Field of view while boosting (game default 120; normal driving is 90).
     NitroFov = 105,

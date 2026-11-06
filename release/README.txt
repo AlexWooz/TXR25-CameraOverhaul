@@ -1,4 +1,4 @@
-TXR Chase Camera 1.0 - camera overhaul for Tokyo Xtreme Racer (Steam)
+TXR Chase Camera 1.1 - camera overhaul for Tokyo Xtreme Racer (Steam)
 =====================================================================
 
 What it does
@@ -15,6 +15,8 @@ What it does
   starts, a lower nitro field of view (105 instead of 120), the camera
   falling back further when accelerating, and motion blur with speed.
 - Close chase view sits a bit further back.
+- Smooth transitions: blends into the driving camera instead of the game's
+  hard cut (e.g. at the end of the camera pan when leaving the garage).
 Cockpit and bonnet views are left as they are.
 
 
@@ -62,3 +64,10 @@ In game, Ctrl+F6 turns the mod off and on, to compare with the vanilla camera.
 Uninstall
 ---------
 Delete the TXRChaseCam and TXRChaseCamInput folders from ue4ss\Mods.
+
+
+Changes
+-------
+1.1  Smooth blend into the driving camera instead of the game's hard cut.
+     Zip now extracts correctly on Linux / Steam Deck.
+1.0  First release.

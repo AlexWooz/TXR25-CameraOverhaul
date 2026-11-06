@@ -118,6 +118,12 @@ local Config = {
     OrbitInvert = false,       -- flip left/right
     OrbitReturnDelay = 0.03,   -- seconds after release before easing back (bridges gaps between signals)
     OrbitReturnSpeed = 12,     -- how fast it eases back (1/s); 12 covers 90 degrees in about 0.25 s
+
+    -- Blend instead of hard-cutting when the view returns to the car (e.g. after the
+    -- leave-garage pan, which vanilla ends with a cut).
+    SmoothViewCuts = true,
+    ViewCutBlendTime = 1.2,    -- seconds
+    ViewCutBlendExp = 2,       -- ease-in/out sharpness
 }
 
 local function log(fmt, ...)
@@ -706,6 +712,100 @@ function applyCloseViewOffsets()
     end
 end
 
+-- Smooth view cuts --------------------------------------------------------
+-- Leaving the garage, the game pans over the car and then hard-cuts to the driving camera: the
+-- view target switches to the car with no blend. When the view target becomes the car, we
+-- spawn a plain CameraActor at the exact pose shown last frame, cut to it, and blend from it
+-- to the car with SetViewTargetWithBlend. The camera is removed once the blend is done.
+
+local cut = { driver = nil, driverSeenAt = 0, prevTarget = nil, prevAddr = nil, pov = nil,
+              temp = nil, tempAddr = nil, removeAt = nil }
+
+local function cameraPov(cm)
+    -- The camera cache is a reflected property, unlike GetCameraRotation(), whose return value
+    -- loses its Pitch in UE4SS.
+    local pov = cm.CameraCachePrivate.POV
+    local l, r = pov.Location, pov.Rotation
+    return { loc = { X = l.X, Y = l.Y, Z = l.Z }, rot = { Pitch = r.Pitch, Yaw = r.Yaw, Roll = r.Roll }, fov = pov.FOV }
+end
+
+local function isCar(actor)
+    local ok, armComp = pcall(function() return actor.CameraArm end)
+    return ok and valid(armComp)
+end
+
+function viewCutTick(arm, dt)
+    -- Every car's arm ticks; run once per frame, on one "driver" arm (re-picked if it goes away).
+    local now = os.clock()
+    if valid(cut.driver) and now - cut.driverSeenAt < 0.5 then
+        if arm:GetAddress() ~= cut.driver:GetAddress() then return end
+    else
+        cut.driver = arm
+    end
+    cut.driverSeenAt = now
+
+    if cut.temp ~= nil and now >= cut.removeAt then
+        pcall(function() if valid(cut.temp) then cut.temp:K2_DestroyActor() end end)
+        cut.temp, cut.tempAddr = nil, nil
+    end
+
+    if not valid(state.pc) then
+        state.pc = FindFirstOf("PlayerController")
+        if not valid(state.pc) then return end
+    end
+    local cm = state.pc.PlayerCameraManager
+    if not valid(cm) then return end
+    local target = cm.ViewTarget.Target
+    local addr = valid(target) and target:GetAddress() or nil
+
+    -- The camera cache holds the pose drawn last frame; cut.pov is the one drawn the frame before.
+    local okP, drawn = pcall(cameraPov, cm)
+    if not okP then drawn = nil end
+
+    if addr ~= cut.prevAddr then
+        log("view target: %s -> %s", valid(cut.prevTarget) and cut.prevTarget:GetFName():ToString() or "none",
+            valid(target) and target:GetFName():ToString() or "none")
+        local fromOther = cut.prevAddr ~= nil and cut.prevAddr ~= cut.tempAddr
+        if Config.SmoothViewCuts and fromOther and drawn ~= nil and valid(target) and isCar(target)
+            and target:GetAddress() == (valid(state.pc.Pawn) and state.pc.Pawn:GetAddress() or -1) then
+            -- If the switch happened after our tick last frame, the cut was already drawn: the
+            -- newest pose jumped away from the one before it, so blend from that older pose.
+            local from, late = drawn, false
+            if cut.pov ~= nil then
+                local dx, dy, dz = drawn.loc.X - cut.pov.loc.X, drawn.loc.Y - cut.pov.loc.Y, drawn.loc.Z - cut.pov.loc.Z
+                if dx * dx + dy * dy + dz * dz > 200 * 200 or math.abs(wrap(drawn.rot.Yaw - cut.pov.rot.Yaw)) > 25 then
+                    from, late = cut.pov, true
+                end
+            end
+            blendFromPov(target, from, late)
+        end
+    end
+    cut.prevTarget, cut.prevAddr = target, addr
+    if drawn ~= nil then cut.pov = drawn end
+end
+
+function blendFromPov(car, pov, late)
+    local cls = StaticFindObject("/Script/Engine.CameraActor")
+    local world = car:GetWorld()
+    local temp = world:SpawnActor(cls, pov.loc, pov.rot)
+    if not valid(temp) then
+        log("view cut: couldn't spawn the blend camera")
+        return
+    end
+    local cam = temp.CameraComponent
+    cam.FieldOfView = pov.fov
+    -- CameraActor letterboxes to 16:9 by default; the game doesn't (Steam Deck is 16:10).
+    cam.bConstrainAspectRatio = false
+    cut.temp, cut.tempAddr = temp, temp:GetAddress()
+    cut.removeAt = os.clock() + Config.ViewCutBlendTime + 0.5
+
+    -- Cut to the parked camera, then blend to the car. EViewTargetBlendFunction 4 = EaseInOut.
+    state.pc:SetViewTargetWithBlend(temp, 0, 0, 0, false)
+    state.pc:SetViewTargetWithBlend(car, Config.ViewCutBlendTime, 4, Config.ViewCutBlendExp, false)
+    log("view cut smoothed: blending to %s over %.1f s%s", car:GetFName():ToString(), Config.ViewCutBlendTime,
+        late and " (cut was already drawn for a frame)" or "")
+end
+
 -- Hooking the arm's tick --------------------------------------------------
 -- The arm Blueprint's ReceiveTick runs once per frame per arm. We run our update once per
 -- frame (on the first player arm that ticks) so the offset is in place for the arm's own math.
@@ -715,6 +815,10 @@ local hooked = false
 local function onArmTick(ctx, deltaSeconds)
     if not Config.Enabled then return end
     local arm = ctx:get()
+    -- Runs before the player-car checks: the cut it smooths happens as the game possesses the
+    -- car, before that car is "ours".
+    local okC, errC = pcall(viewCutTick, arm, deltaSeconds:get())
+    if not okC then log("view cut smoothing failed: %s", tostring(errC)) end
     if not refreshPawn() then return end
     if not state.armAddrs[arm:GetAddress()] then return end
     -- Each player arm ticks once per frame; only update on the first one.
