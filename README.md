@@ -11,6 +11,9 @@ Status: **first prototype**, a UE4SS Lua mod.
 | Ctrl+Up/Down | LagSpeed ±0.5 (higher = stiffer) |
 | Ctrl+Right/Left | MaxOffset ±5° |
 | Ctrl+F5 | Debug log |
+| Ctrl+PgUp/PgDn | Close-view distance ±25 (default +100) |
+| Ctrl+Home/End | Close-view height ±10 |
+| Right stick | Orbit (chase/far views): the camera looks where the stick points; release returns behind the car. `OrbitMode = "spin"` spins instead |
 
 Defaults live in the `Config` table at the top of `mod/TXRChaseCam/Scripts/main.lua`.
 

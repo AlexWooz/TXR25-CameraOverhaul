@@ -12,6 +12,11 @@
 --   Ctrl+Up/Down     LagSpeed +/- 0.5   (higher = stiffer, catches up faster)
 --   Ctrl+Right/Left  MaxOffset +/- 5    (max degrees the camera can trail)
 --   Ctrl+F5          toggle debug log (4x/s: speed, yaw rate, offset)
+--   Ctrl+PgUp/PgDn   close-view distance +/- 25
+--   Ctrl+Home/End    close-view height +/- 10
+--
+-- Right stick (controller): orbit around the car in the chase and far views. Left/right spins
+-- the camera, down swings it to the front, releasing eases it back. See the Orbit section.
 
 local Config = {
     Enabled = true,
@@ -32,6 +37,25 @@ local Config = {
     GameSlipMax = 30,
     -- A heading jump bigger than this in one frame (respawn, teleport, replay) resets the lag.
     SnapResetDegrees = 60,
+    -- Extra distance and height for the close chase view (CameraArm, ~450 units behind by
+    -- default), passed to the arm's SetTargetLengthOffset / SetRelativeLocationZOffset.
+    CloseDistanceOffset = 100,
+    CloseHeightOffset = 0,
+
+    -- Right-stick orbit (chase and far views). The game only reports the stick past ~75%
+    -- deflection, as separate look-left/right/back signals (nothing for up).
+    --   "direct": the camera looks where the stick points (stick right -> camera on the car's
+    --             left looking right, stick down -> looking back at the car's front). The angle
+    --             is rebuilt from those signals assuming the stick is pushed to the edge.
+    --   "spin":   holding left/right spins the camera around the car, down swings it to the front.
+    -- Releasing the stick eases the camera back behind the car in both modes.
+    OrbitEnabled = true,
+    OrbitMode = "direct",
+    OrbitFollowSpeed = 10,     -- direct: how fast the camera reaches the stick angle (1/s)
+    OrbitSpeed = 150,          -- spin: degrees per second at full deflection
+    OrbitInvert = false,       -- flip left/right
+    OrbitReturnDelay = 0.03,   -- seconds after release before easing back (bridges gaps between signals)
+    OrbitReturnSpeed = 12,     -- how fast it eases back (1/s); 12 covers 90 degrees in about 0.25 s
 }
 
 local function log(fmt, ...)
@@ -150,7 +174,170 @@ local function update(dt)
     local driftScale = 1 + (Config.DriftScale - 1) * slipFrac
 
     state.offset = trail * speedFade * driftScale
-    setArmOffsets(state.offset)
+
+    local orbitYaw = updateOrbit(dt)
+    setArmOffsets(state.offset + orbitYaw)
+
+    applyCloseViewOffsets()
+end
+
+-- Orbit -------------------------------------------------------------------
+
+-- Latest look signal per direction, written by the input hooks: { mag = 0..1, at = os.clock() }.
+local look = { Left = nil, Right = nil, Back = nil }
+-- lastSide: which side (-1 left, 1 right) the stick was last on, to resolve "down only".
+-- lowerHalf: whether the stick was last below horizontal, to resolve "side only".
+local orbit = { yaw = 0, lastInputAt = -1, lastSide = 0, lowerHalf = false }
+
+-- Rebuilds the look angle (0 = forward, +90 = right, 180 = back) from the thresholded
+-- signals, assuming the stick is at the edge of its gate. Returns nil when nothing fires.
+local function stickLookAngle(x, back)
+    if x == 0 and back == 0 then return nil end
+    local fwd
+    if back > 0 then
+        if x == 0 then
+            x = orbit.lastSide * math.sqrt(math.max(0, 1 - back * back))
+        end
+        fwd = -back
+    else
+        local y = math.sqrt(math.max(0, 1 - x * x))
+        fwd = orbit.lowerHalf and -y or y
+    end
+    if x ~= 0 then orbit.lastSide = x > 0 and 1 or -1 end
+    orbit.lowerHalf = fwd < 0
+    return math.deg(math.atan(x, fwd))
+end
+
+local function lookActive(dir)
+    local l = look[dir]
+    -- Events fire every frame while held, so 50 ms without one means released.
+    return l ~= nil and os.clock() - l.at < 0.05, l and l.mag or 0
+end
+
+-- Only the chase (camera_type 0) and far (8) views orbit; cockpit and bonnet stay vanilla.
+local function orbitView(pawn)
+    local ok, t = pcall(function() return pawn.camera_type end)
+    if not ok then return nil end
+    if t == 0 then return pawn.OutCamera end
+    if t == 8 then return pawn.FarCamera end
+    return nil
+end
+
+function updateOrbit(dt)
+    local pawn = state.pawn
+    local mainCam = Config.OrbitEnabled and orbitView(pawn) or nil
+    if mainCam == nil then
+        orbit.yaw = 0
+        return 0
+    end
+
+    local now = os.clock()
+    local backOn, backMag = lookActive("Back")
+    local rightOn, rightMag = lookActive("Right")
+    local leftOn, leftMag = lookActive("Left")
+    local held = backOn or rightOn or leftOn
+
+    if Config.OrbitMode == "direct" then
+        local x = (rightOn and clamp(rightMag, 0, 1) or 0) - (leftOn and clamp(leftMag, 0, 1) or 0)
+        if Config.OrbitInvert then x = -x end
+        local target = stickLookAngle(x, backOn and clamp(backMag, 0, 1) or 0)
+        if target ~= nil then
+            orbit.yaw = wrap(orbit.yaw + wrap(target - orbit.yaw) * (1 - math.exp(-Config.OrbitFollowSpeed * dt)))
+            orbit.lastInputAt = now
+        elseif now - orbit.lastInputAt > Config.OrbitReturnDelay then
+            orbit.yaw = wrap(orbit.yaw) * math.exp(-Config.OrbitReturnSpeed * dt)
+            if math.abs(orbit.yaw) < 0.05 then orbit.yaw = 0 end
+            orbit.lastSide, orbit.lowerHalf = 0, false
+        end
+        suppressGameLookCamera(pawn, mainCam, held)
+        return orbit.yaw
+    end
+
+    -- Spin mode. Signals start at ~0.75; map 0.75..1 to 40%..100% speed.
+    local function rate(mag) return 0.4 + 0.6 * clamp((mag - 0.75) / 0.25, 0, 1) end
+    local x = (rightOn and rate(rightMag) or 0) - (leftOn and rate(leftMag) or 0)
+    if Config.OrbitInvert then x = -x end
+
+    if backOn then
+        -- Swing toward the front (180), the short way round.
+        local target = orbit.yaw >= 0 and 180 or -180
+        local stepMax = Config.OrbitSpeed * dt
+        orbit.yaw = orbit.yaw + clamp(target - orbit.yaw, -stepMax, stepMax)
+        orbit.lastInputAt = now
+    elseif x ~= 0 then
+        orbit.yaw = wrap(orbit.yaw + x * Config.OrbitSpeed * dt)
+        orbit.lastInputAt = now
+    elseif now - orbit.lastInputAt > Config.OrbitReturnDelay then
+        orbit.yaw = wrap(orbit.yaw) * math.exp(-Config.OrbitReturnSpeed * dt)
+        if math.abs(orbit.yaw) < 0.05 then orbit.yaw = 0 end
+    end
+
+    suppressGameLookCamera(pawn, mainCam, held)
+    return orbit.yaw
+end
+
+-- While the stick is held (or the camera hasn't come back yet), keep the game's fixed look
+-- camera (RearCamera) off and the chase/far camera on, so our orbit is what's shown.
+function suppressGameLookCamera(pawn, mainCam, held)
+    if not held and orbit.yaw == 0 then return end
+    local rear = pawn.RearCamera
+    if valid(rear) and rear:IsActive() then
+        rear:Deactivate()
+        mainCam:Activate(false)
+    end
+end
+
+-- Hooks the controller's Enhanced Input events for the look actions
+-- (InpActEvt_IA_NIG_ViewLeft/Right/Back_K2Node_EnhancedInputActionEvent_N). ViewLeft reports
+-- 1 + x (0.25 at the threshold, 0 at full left), the others report the magnitude.
+local inputLib = nil
+local inputHookedClass = nil
+
+function hookLookInput()
+    local pc = state.pc
+    if not valid(pc) then return false end
+    local cls = pc:GetClass()
+    local classPath = cls:GetFullName():match("%s(.+)$")
+    if inputHookedClass == classPath then return true end
+    inputLib = inputLib or StaticFindObject("/Script/EnhancedInput.Default__EnhancedInputLibrary")
+    local count = 0
+    cls:ForEachFunction(function(fn)
+        local n = fn:GetFName():ToString()
+        local dir = n:match("^InpActEvt_IA_NIG_View(%a+)_K2Node_EnhancedInputActionEvent_%d+$")
+        if dir == "Left" or dir == "Right" or dir == "Back" then
+            local ok = pcall(RegisterHook, classPath .. ":" .. n, function(_, value)
+                local v = 0
+                pcall(function() v = inputLib:Conv_InputActionValueToAxis2D(value:get()).X end)
+                local mag = dir == "Left" and (1 - v) or v
+                look[dir] = { mag = mag, at = os.clock() }
+            end)
+            if ok then count = count + 1 end
+        end
+    end)
+    if count == 0 then return false end
+    inputHookedClass = classPath
+    log("hooked %d look input event(s) on %s", count, cls:GetFName():ToString())
+    return true
+end
+
+-- Distance/height for the close view. Only called when a value changes (or the car changes):
+-- calling the setters every frame changed how the camera moved in turns.
+local applied = { arm = nil, distance = 0, height = 0 }
+function applyCloseViewOffsets()
+    local main = state.mainArm
+    if not valid(main) or main:GetFName():ToString() ~= "CameraArm" then return end
+    local addr = main:GetAddress()
+    if applied.arm ~= addr then
+        applied = { arm = addr, distance = 0, height = 0 } -- a fresh arm starts at 0
+    end
+    if applied.distance ~= Config.CloseDistanceOffset then
+        main:SetTargetLengthOffset(Config.CloseDistanceOffset)
+        applied.distance = Config.CloseDistanceOffset
+    end
+    if applied.height ~= Config.CloseHeightOffset then
+        main:SetRelativeLocationZOffset(Config.CloseHeightOffset)
+        applied.height = Config.CloseHeightOffset
+    end
 end
 
 -- Hooking the arm's tick --------------------------------------------------
@@ -166,6 +353,13 @@ local function onArmTick(ctx, deltaSeconds)
     if not state.armAddrs[arm:GetAddress()] then return end
     -- Each player arm ticks once per frame; only update on the first one.
     if arm:GetAddress() ~= state.arms[1]:GetAddress() then return end
+    if inputHookedClass == nil and Config.OrbitEnabled then
+        local okH, errH = pcall(hookLookInput)
+        if not okH then
+            log("look input hook failed: %s", tostring(errH))
+            Config.OrbitEnabled = false
+        end
+    end
     local ok, err = pcall(update, deltaSeconds:get())
     if not ok then log("update failed: %s", tostring(err)) end
 end
@@ -204,8 +398,8 @@ LoopAsync(250, function()
                 local gap = wrap(state.pc.PlayerCameraManager:GetCameraRotation().Yaw - state.pawn:K2_GetActorRotation().Yaw)
                 local gameSlip = 0
                 pcall(function() gameSlip = state.mainArm.slip_angle end)
-                log("%s %6.1f km/h  yaw rate %7.1f deg/s  offset %6.2f  game slip %6.2f  cam-car %6.2f",
-                    Config.Enabled and "ON " or "OFF", state.kmh, state.yawRate, state.offset, gameSlip, gap)
+                log("%s %6.1f km/h  yaw rate %7.1f deg/s  offset %6.2f  orbit %7.1f  game slip %6.2f  cam-car %6.2f",
+                    Config.Enabled and "ON " or "OFF", state.kmh, state.yawRate, state.offset, orbit.yaw, gameSlip, gap)
             end)
         end)
     end
@@ -219,6 +413,11 @@ RegisterKeyBind(Key.F6, { ModifierKey.CONTROL }, function()
     ExecuteInGameThread(function()
         resetLag()
         pcall(setArmOffsets, 0)
+        pcall(function()
+            state.mainArm:SetTargetLengthOffset(0)
+            state.mainArm:SetRelativeLocationZOffset(0)
+            applied = { arm = state.mainArm:GetAddress(), distance = 0, height = 0 }
+        end)
     end)
     log("chase cam %s", Config.Enabled and "ON" or "OFF (vanilla)")
 end)
@@ -229,8 +428,26 @@ RegisterKeyBind(Key.F5, { ModifierKey.CONTROL }, function()
 end)
 
 local function tuned()
-    log("LagSpeed %.1f  MaxOffset %d", Config.LagSpeed, Config.MaxOffset)
+    log("LagSpeed %.1f  MaxOffset %d  CloseDistanceOffset %d  CloseHeightOffset %d",
+        Config.LagSpeed, Config.MaxOffset, Config.CloseDistanceOffset, Config.CloseHeightOffset)
 end
+
+RegisterKeyBind(Key.PAGE_UP, { ModifierKey.CONTROL }, function()
+    Config.CloseDistanceOffset = Config.CloseDistanceOffset + 25
+    tuned()
+end)
+RegisterKeyBind(Key.PAGE_DOWN, { ModifierKey.CONTROL }, function()
+    Config.CloseDistanceOffset = Config.CloseDistanceOffset - 25
+    tuned()
+end)
+RegisterKeyBind(Key.HOME, { ModifierKey.CONTROL }, function()
+    Config.CloseHeightOffset = Config.CloseHeightOffset + 10
+    tuned()
+end)
+RegisterKeyBind(Key.END, { ModifierKey.CONTROL }, function()
+    Config.CloseHeightOffset = Config.CloseHeightOffset - 10
+    tuned()
+end)
 
 RegisterKeyBind(Key.UP_ARROW, { ModifierKey.CONTROL }, function()
     Config.LagSpeed = Config.LagSpeed + 0.5
