@@ -41,3 +41,6 @@ In game, **Ctrl+F6** toggles the mod. With `DevKeys = true` in `config.lua`:
 | `tools/package.ps1` | Builds `release/TXRChaseCam-<version>.zip` |
 | `release/README.txt` | The readme shipped in the zip |
 | `docs/TECHNICAL.md` | Game internals and how the mod works |
+
+## License
+[MIT](LICENSE), the same as UE4SS.

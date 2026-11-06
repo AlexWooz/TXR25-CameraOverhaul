@@ -23,6 +23,7 @@ try {
         [IO.File]::WriteAllText((Join-Path $stage "$m\enabled.txt"), "")
     }
     Copy-Item (Join-Path $root "release\README.txt") $stage
+    Copy-Item (Join-Path $root "LICENSE") (Join-Path $stage "LICENSE.txt")
 
     New-Item -ItemType Directory -Force $Out | Out-Null
     $zip = Join-Path (Resolve-Path $Out) "TXRChaseCam-$Version.zip"
